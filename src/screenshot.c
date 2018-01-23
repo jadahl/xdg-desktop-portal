@@ -84,7 +84,11 @@ send_response_in_thread_func (GTask *task,
   if (response != 0)
     goto out;
 
-  g_variant_lookup (options, "uri", "&s", &uri);
+  if (!g_variant_lookup (options, "uri", "&s", &uri))
+    {
+      g_warning ("No URI was provided");
+      goto out;
+    }
 
   ruri = register_document (uri, request->app_id, FALSE, FALSE, &error);
   if (ruri == NULL)
@@ -132,7 +136,8 @@ screenshot_done (GObject *source,
 }
 
 static XdpOptionKey screenshot_options[] = {
-  { "modal", G_VARIANT_TYPE_BOOLEAN }
+  { "modal", G_VARIANT_TYPE_BOOLEAN },
+  { "interactive", G_VARIANT_TYPE_BOOLEAN }
 };
 
 static gboolean

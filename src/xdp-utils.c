@@ -28,6 +28,7 @@
 
 #include "xdp-utils.h"
 #include "request.h"
+#include "session.h"
 
 G_LOCK_DEFINE (app_infos);
 static GHashTable *app_infos;
@@ -259,6 +260,7 @@ name_owner_changed (GDBusConnection *connection,
       G_UNLOCK (app_infos);
 
       close_requests_for_sender (name);
+      close_sessions_for_sender (name);
     }
 }
 
@@ -337,7 +339,7 @@ xdp_get_path_for_fd (GKeyFile *app_info,
       ((fd_flags & O_PATH) != O_PATH) ||
       ((fd_flags & O_NOFOLLOW) == O_NOFOLLOW) ||
       fstat (fd, &st_buf) < 0 ||
-      (st_buf.st_mode & S_IFMT) != S_IFREG ||
+      ((st_buf.st_mode & S_IFMT) != S_IFREG && (st_buf.st_mode & S_IFMT) != S_IFDIR) ||
       (symlink_size = readlink (proc_path, path_buffer, PATH_MAX)) < 0)
     {
       return NULL;
