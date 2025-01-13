@@ -91,18 +91,23 @@ def get_mock_iface(bus: dbus.Bus, bus_name: Optional[str] = None):
     return dbus.Interface(obj, dbusmock.MOCK_IFACE)
 
 
-def portal_interface_name(portal_name) -> str:
+def portal_interface_name(portal_name, domain: Optional[str] = None) -> str:
     """
     Returns the fully qualified interface for a portal name.
     """
-    return f"org.freedesktop.portal.{portal_name}"
+    if domain:
+        return f"org.freedesktop.{domain}.portal.{portal_name}"
+    else:
+        return f"org.freedesktop.portal.{portal_name}"
 
 
-def get_portal_iface(bus: dbus.Bus, name: str) -> dbus.Interface:
+def get_portal_iface(
+    bus: dbus.Bus, name: str, domain: Optional[str] = None
+) -> dbus.Interface:
     """
     Returns the dbus interface for a portal name.
     """
-    name = portal_interface_name(name)
+    name = portal_interface_name(name, domain)
     return get_iface(bus, name)
 
 
@@ -139,14 +144,16 @@ def get_xdp_dbus_object(bus: dbus.Bus) -> dbus.proxies.ProxyObject:
     return obj
 
 
-def check_version(bus: dbus.Bus, portal_name: str, expected_version: int):
+def check_version(
+    bus: dbus.Bus, portal_name: str, expected_version: int, domain: Optional[str] = None
+):
     """
     Checks that the portal_name portal version is equal to expected_version.
     """
     properties_intf = dbus.Interface(
         get_xdp_dbus_object(bus), "org.freedesktop.DBus.Properties"
     )
-    portal_iface_name = portal_interface_name(portal_name)
+    portal_iface_name = portal_interface_name(portal_name, domain)
     try:
         portal_version = properties_intf.Get(portal_iface_name, "version")
         assert int(portal_version) == expected_version
