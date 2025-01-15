@@ -54,7 +54,19 @@
 #define DBUS_PATH_DBUS "/org/freedesktop/DBus"
 
 G_LOCK_DEFINE (app_infos);
-static GHashTable *app_info_by_unique_name;
+static GHashTable *peer_by_unique_name;
+static GHashTable *peer_by_pid;
+
+G_STATIC_ASSERT (sizeof (pid_t) <= sizeof (int));
+
+typedef struct _XdpPeer
+{
+  grefcount ref_count;
+
+  GHashTable *peer_names;
+  pid_t pid;
+  XdpAppInfo *app_info;
+} XdpPeer;
 
 G_DEFINE_QUARK (XdpAppInfo, xdp_app_info_error);
 
@@ -75,6 +87,53 @@ typedef struct _XdpAppInfoPrivate
 } XdpAppInfoPrivate;
 
 G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (XdpAppInfo, xdp_app_info, G_TYPE_OBJECT)
+
+static XdpPeer *
+xdp_peer_new (const char *peer_name,
+              pid_t       pid,
+              XdpAppInfo *app_info)
+{
+  XdpPeer *peer;
+
+  peer = g_new0 (XdpPeer, 1);
+  g_ref_count_init (&peer->ref_count);
+  peer->peer_names = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                            g_free, NULL);
+  g_hash_table_add (peer->peer_names, g_strdup (peer_name));
+  peer->pid = pid;
+  peer->app_info = g_object_ref (app_info);
+
+  return peer;
+}
+
+static void
+xdp_peer_add_peer_name (XdpPeer    *peer,
+                        const char *peer_name)
+{
+  g_return_if_fail (!g_hash_table_contains (peer->peer_names, peer_name));
+
+  g_hash_table_add (peer->peer_names, g_strdup (peer_name));
+}
+
+static XdpPeer *
+xdp_peer_ref (XdpPeer *peer)
+{
+  g_ref_count_inc (&peer->ref_count);
+  return peer;
+}
+
+static void
+xdp_peer_unref (XdpPeer *peer)
+{
+  if (g_ref_count_dec (&peer->ref_count))
+    {
+      g_hash_table_unref (peer->peer_names);
+      g_object_unref (peer->app_info);
+      g_free (peer);
+    }
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (XdpPeer, xdp_peer_unref);
 
 static void
 xdp_app_info_dispose (GObject *object)
@@ -696,16 +755,44 @@ xdp_connection_get_pidfd (GDBusConnection  *connection,
 }
 
 static XdpAppInfo *
+cache_lookup_app_info_by_pid_and_extend (pid_t       pid,
+                                         const char *sender)
+{
+  XdpAppInfo *app_info = NULL;
+
+  G_LOCK (app_infos);
+  if (peer_by_pid)
+    {
+      XdpPeer *peer = NULL;
+
+      peer = g_hash_table_lookup (peer_by_pid, GINT_TO_POINTER (pid));
+      if (peer)
+        {
+          app_info = g_object_ref (peer->app_info);
+
+          xdp_peer_add_peer_name (peer, sender);
+          g_hash_table_insert (peer_by_unique_name, g_strdup (sender),
+                               xdp_peer_ref (peer));
+        }
+    }
+  G_UNLOCK (app_infos);
+
+  return app_info;
+}
+
+static XdpAppInfo *
 cache_lookup_app_info_by_sender (const char *sender)
 {
   XdpAppInfo *app_info = NULL;
 
   G_LOCK (app_infos);
-  if (app_info_by_unique_name)
+  if (peer_by_unique_name)
     {
-      app_info = g_hash_table_lookup (app_info_by_unique_name, sender);
-      if (app_info)
-        g_object_ref (app_info);
+      XdpPeer *peer;
+
+      peer = g_hash_table_lookup (peer_by_unique_name, sender);
+      if (peer)
+        app_info = g_object_ref (peer->app_info);
     }
   G_UNLOCK (app_infos);
 
@@ -718,30 +805,57 @@ cache_has_app_info_by_sender (const char *sender)
   gboolean has_app_info = FALSE;
 
   G_LOCK (app_infos);
-  if (app_info_by_unique_name)
-    has_app_info = !!g_hash_table_lookup (app_info_by_unique_name, sender);
+  if (peer_by_unique_name)
+    has_app_info = !!g_hash_table_lookup (peer_by_unique_name, sender);
+  G_UNLOCK (app_infos);
+
+  return has_app_info;
+}
+
+static gboolean
+cache_has_app_info_by_pid (pid_t pid)
+{
+  gboolean has_app_info = FALSE;
+
+  G_LOCK (app_infos);
+  if (peer_by_pid)
+    has_app_info = !!g_hash_table_lookup (peer_by_pid, GINT_TO_POINTER (pid));
   G_UNLOCK (app_infos);
 
   return has_app_info;
 }
 
 static void
-ensure_app_info_by_unique_name (void)
+ensure_app_info_cache (void)
 {
-  if (app_info_by_unique_name == NULL)
-    app_info_by_unique_name = g_hash_table_new_full (g_str_hash, g_str_equal,
-                                                     g_free,
-                                                     g_object_unref);
+  if (peer_by_unique_name)
+    return;
+
+  peer_by_unique_name = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                               g_free,
+                                               (GDestroyNotify) xdp_peer_unref);
+  peer_by_pid = g_hash_table_new_full (NULL, NULL,
+                                       NULL,
+                                       (GDestroyNotify) xdp_peer_unref);
 }
 
 static void
 cache_insert_app_info (const char *sender,
+                       pid_t       pid,
                        XdpAppInfo *app_info)
 {
+  g_autoptr(XdpPeer) peer = NULL;
+
+  peer = xdp_peer_new (sender, pid, app_info);
+
   G_LOCK (app_infos);
-  ensure_app_info_by_unique_name ();
-  g_hash_table_insert (app_info_by_unique_name, g_strdup (sender),
-                       g_object_ref (app_info));
+  ensure_app_info_cache ();
+  g_hash_table_insert (peer_by_unique_name, g_strdup (sender),
+                       xdp_peer_ref (peer));
+
+  g_warn_if_fail (!g_hash_table_contains (peer_by_pid, GINT_TO_POINTER (pid)));
+  g_hash_table_insert (peer_by_pid, GINT_TO_POINTER (pid),
+                       xdp_peer_ref (peer));
   G_UNLOCK (app_infos);
 }
 
@@ -749,8 +863,30 @@ static void
 on_peer_died (const char *name)
 {
   G_LOCK (app_infos);
-  if (app_info_by_unique_name)
-    g_hash_table_remove (app_info_by_unique_name, name);
+  if (peer_by_unique_name)
+    {
+      gpointer stolen_key;
+      gpointer stolen_value;
+
+      if (g_hash_table_steal_extended (peer_by_unique_name,
+                                       name,
+                                       &stolen_key,
+                                       &stolen_value))
+        {
+          g_autoptr(XdpPeer) peer = NULL;
+          g_autofree char *peer_name = NULL;
+
+          peer_name = stolen_key;
+          peer = stolen_value;
+
+          g_hash_table_remove (peer->peer_names, name);
+          if (g_hash_table_size (peer->peer_names) == 0)
+            {
+              g_debug ("Peer %s was last connection for pid %d", peer_name, peer->pid);
+              g_hash_table_remove (peer_by_pid, GINT_TO_POINTER (peer->pid));
+            }
+        }
+    }
   G_UNLOCK (app_infos);
 }
 
@@ -784,20 +920,28 @@ maybe_create_registered_test_app_info (const char *registered_app_id)
                                 test_override_usb_queries);
 }
 
+static void
+ensure_name_owners_tracked (GDBusConnection *connection)
+{
+  if (g_object_get_data (G_OBJECT (connection), "xdp-app-info-peer-tracker"))
+    return;
+
+  g_object_set_data (G_OBJECT (connection), "xdp-app-info-peer-tracker",
+                     GINT_TO_POINTER (TRUE));
+  xdp_connection_track_name_owners (connection, on_peer_died);
+}
+
 static XdpAppInfo *
 xdp_connection_create_app_info_sync (GDBusConnection  *connection,
                                      const char       *sender,
+                                     pid_t             pid,
+                                     int               pidfd,
                                      GCancellable     *cancellable,
                                      GError          **error)
 {
   g_autoptr(XdpAppInfo) app_info = NULL;
-  g_autofd int pidfd = -1;
-  uint32_t pid;
   g_autoptr(GError) local_error = NULL;
   const char *app_info_kind = NULL;
-
-  if (!xdp_connection_get_pidfd (connection, sender, cancellable, &pidfd, &pid, error))
-    return NULL;
 
   app_info = maybe_create_test_app_info ();
   if (app_info)
@@ -841,11 +985,12 @@ xdp_connection_create_app_info_sync (GDBusConnection  *connection,
 
   g_return_val_if_fail (app_info != NULL, NULL);
 
-  g_debug ("Adding %s app '%s'", app_info_kind, xdp_app_info_get_id (app_info));
+  g_debug ("Adding %s app '%s' with pid %d",
+           app_info_kind, xdp_app_info_get_id (app_info), pid);
 
-  cache_insert_app_info (sender, app_info);
+  cache_insert_app_info (sender, pid, app_info);
 
-  xdp_connection_track_name_owners (connection, on_peer_died);
+  ensure_name_owners_tracked (connection);
 
   return g_steal_pointer (&app_info);
 }
@@ -854,15 +999,12 @@ static XdpAppInfo *
 xdp_connection_create_host_app_info_sync (GDBusConnection  *connection,
                                           const char       *sender,
                                           const char       *app_id,
+                                          pid_t             pid,
+                                          int               pidfd,
                                           GCancellable     *cancellable,
                                           GError          **error)
 {
   g_autoptr(XdpAppInfo) app_info = NULL;
-  g_autofd int pidfd = -1;
-  uint32_t pid;
-
-  if (!xdp_connection_get_pidfd (connection, sender, cancellable, &pidfd, &pid, error))
-    return NULL;
 
   app_info = maybe_create_registered_test_app_info (app_id);
 
@@ -895,11 +1037,12 @@ xdp_connection_create_host_app_info_sync (GDBusConnection  *connection,
         return NULL;
     }
 
-  g_debug ("Adding registered host app '%s'", xdp_app_info_get_id (app_info));
+  g_debug ("Adding registered host app '%s' from sender %s for pid %d",
+           xdp_app_info_get_id (app_info), sender, pid);
 
-  cache_insert_app_info (sender, app_info);
+  cache_insert_app_info (sender, pid, app_info);
 
-  xdp_connection_track_name_owners (connection, on_peer_died);
+  ensure_name_owners_tracked (connection);
 
   return g_steal_pointer (&app_info);
 }
@@ -912,13 +1055,30 @@ xdp_invocation_ensure_app_info_sync (GDBusMethodInvocation  *invocation,
   GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
   const char *sender = g_dbus_method_invocation_get_sender (invocation);
   g_autoptr(XdpAppInfo) app_info = NULL;
+  g_autofd int pidfd = -1;
+  uint32_t pid;
 
   app_info = cache_lookup_app_info_by_sender (sender);
   if (app_info)
     return g_steal_pointer (&app_info);
 
+  if (!xdp_connection_get_pidfd (connection, sender, cancellable,
+                                 &pidfd, &pid, error))
+    return NULL;
+
+  app_info = cache_lookup_app_info_by_pid_and_extend (pid, sender);
+  if (app_info)
+    {
+      g_debug ("Using existing app info '%s' for peer %s from pid %d",
+               xdp_app_info_get_id (app_info), sender, pid);
+      ensure_name_owners_tracked (connection);
+      return g_steal_pointer (&app_info);
+    }
+
   return xdp_connection_create_app_info_sync (connection,
                                               sender,
+                                              pid,
+                                              pidfd,
                                               cancellable,
                                               error);
 }
@@ -931,6 +1091,8 @@ xdp_invocation_register_host_app_info_sync (GDBusMethodInvocation  *invocation,
 {
   GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
   const char *sender = g_dbus_method_invocation_get_sender (invocation);
+  g_autofd int pidfd = -1;
+  uint32_t pid;
 
   if (cache_has_app_info_by_sender (sender))
     {
@@ -939,9 +1101,22 @@ xdp_invocation_register_host_app_info_sync (GDBusMethodInvocation  *invocation,
       return NULL;
     }
 
+  if (!xdp_connection_get_pidfd (connection, sender, cancellable,
+                                 &pidfd, &pid, error))
+    return NULL;
+
+  if (cache_has_app_info_by_pid (pid))
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "PID already associated with an application ID");
+      return NULL;
+    }
+
   return xdp_connection_create_host_app_info_sync (connection,
                                                    sender,
                                                    app_id,
+                                                   pid,
+                                                   pidfd,
                                                    cancellable,
                                                    error);
 }
