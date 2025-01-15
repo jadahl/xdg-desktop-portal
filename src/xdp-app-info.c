@@ -755,8 +755,10 @@ xdp_connection_get_pidfd (GDBusConnection  *connection,
 }
 
 static XdpAppInfo *
-cache_lookup_app_info_by_pid_and_extend (pid_t       pid,
-                                         const char *sender)
+cache_lookup_app_info_by_pid_and_extend (pid_t        pid,
+                                         const char  *sender,
+                                         const char  *expected_app_id,
+                                         GError     **error)
 {
   XdpAppInfo *app_info = NULL;
 
@@ -768,11 +770,21 @@ cache_lookup_app_info_by_pid_and_extend (pid_t       pid,
       peer = g_hash_table_lookup (peer_by_pid, GINT_TO_POINTER (pid));
       if (peer)
         {
-          app_info = g_object_ref (peer->app_info);
+          if (!expected_app_id ||
+              g_strcmp0 (xdp_app_info_get_id (peer->app_info),
+                         expected_app_id) == 0)
+            {
+              app_info = g_object_ref (peer->app_info);
 
-          xdp_peer_add_peer_name (peer, sender);
-          g_hash_table_insert (peer_by_unique_name, g_strdup (sender),
-                               xdp_peer_ref (peer));
+              xdp_peer_add_peer_name (peer, sender);
+              g_hash_table_insert (peer_by_unique_name, g_strdup (sender),
+                                   xdp_peer_ref (peer));
+            }
+          else
+            {
+              g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                           "Tried to extend peer with different application ID");
+            }
         }
     }
   G_UNLOCK (app_infos);
@@ -797,32 +809,6 @@ cache_lookup_app_info_by_sender (const char *sender)
   G_UNLOCK (app_infos);
 
   return app_info;
-}
-
-static gboolean
-cache_has_app_info_by_sender (const char *sender)
-{
-  gboolean has_app_info = FALSE;
-
-  G_LOCK (app_infos);
-  if (peer_by_unique_name)
-    has_app_info = !!g_hash_table_lookup (peer_by_unique_name, sender);
-  G_UNLOCK (app_infos);
-
-  return has_app_info;
-}
-
-static gboolean
-cache_has_app_info_by_pid (pid_t pid)
-{
-  gboolean has_app_info = FALSE;
-
-  G_LOCK (app_infos);
-  if (peer_by_pid)
-    has_app_info = !!g_hash_table_lookup (peer_by_pid, GINT_TO_POINTER (pid));
-  G_UNLOCK (app_infos);
-
-  return has_app_info;
 }
 
 static void
@@ -1066,7 +1052,7 @@ xdp_invocation_ensure_app_info_sync (GDBusMethodInvocation  *invocation,
                                  &pidfd, &pid, error))
     return NULL;
 
-  app_info = cache_lookup_app_info_by_pid_and_extend (pid, sender);
+  app_info = cache_lookup_app_info_by_pid_and_extend (pid, sender, NULL, NULL);
   if (app_info)
     {
       g_debug ("Using existing app info '%s' for peer %s from pid %d",
@@ -1083,7 +1069,7 @@ xdp_invocation_ensure_app_info_sync (GDBusMethodInvocation  *invocation,
                                               error);
 }
 
-XdpAppInfo *
+gboolean
 xdp_invocation_register_host_app_info_sync (GDBusMethodInvocation  *invocation,
                                             const char             *app_id,
                                             GCancellable           *cancellable,
@@ -1091,32 +1077,57 @@ xdp_invocation_register_host_app_info_sync (GDBusMethodInvocation  *invocation,
 {
   GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
   const char *sender = g_dbus_method_invocation_get_sender (invocation);
+  g_autoptr(XdpAppInfo) app_info = NULL;
   g_autofd int pidfd = -1;
   uint32_t pid;
+  g_autoptr(GError) local_error = NULL;
 
-  if (cache_has_app_info_by_sender (sender))
+  app_info = cache_lookup_app_info_by_sender (sender);
+  if (app_info)
     {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Connection already associated with an application ID");
-      return NULL;
+      if (g_strcmp0 (xdp_app_info_get_id (app_info), app_id) == 0)
+        {
+          g_set_error (error, XDP_APP_INFO_ERROR,
+                       XDP_APP_INFO_ERROR_REDUNDANT_REGISTRATION,
+                       "Connection already registered with the same application ID");
+        }
+      else
+        {
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                       "Connection already associated with a different application ID");
+        }
+      return FALSE;
     }
 
   if (!xdp_connection_get_pidfd (connection, sender, cancellable,
                                  &pidfd, &pid, error))
-    return NULL;
+    return FALSE;
 
-  if (cache_has_app_info_by_pid (pid))
+  app_info = cache_lookup_app_info_by_pid_and_extend (pid, sender, app_id,
+                                                      &local_error);
+  if (local_error)
     {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "PID already associated with an application ID");
-      return NULL;
+      g_propagate_error (error, g_steal_pointer (&local_error));
+      return FALSE;
     }
 
-  return xdp_connection_create_host_app_info_sync (connection,
-                                                   sender,
-                                                   app_id,
-                                                   pid,
-                                                   pidfd,
-                                                   cancellable,
-                                                   error);
+  if (app_info)
+    {
+      g_set_error (error, XDP_APP_INFO_ERROR,
+                   XDP_APP_INFO_ERROR_REDUNDANT_REGISTRATION,
+                   "Process already registered with the same application ID");
+      return FALSE;
+    }
+
+  app_info = xdp_connection_create_host_app_info_sync (connection,
+                                                       sender,
+                                                       app_id,
+                                                       pid,
+                                                       pidfd,
+                                                       cancellable,
+                                                       error);
+  if (!app_info)
+    return FALSE;
+
+  return TRUE;
 }

@@ -103,3 +103,34 @@ class TestRegistry:
         app_id2 = mock_intf2.GetSessionAppId(session2.handle)
         assert app_id2 == expected_app_id
         dbus_con2.close()
+
+    def test_redundant_register(self, portals, dbus_con):
+        registry_intf = xdp.get_portal_iface(dbus_con, "Registry", domain="host")
+        mock_intf = xdp.get_mock_iface(dbus_con)
+
+        expected_app_id = "org.example.CorrectAppId"
+
+        registry_intf.Register(expected_app_id, {})
+        session = self.create_dummy_session(dbus_con)
+        app_id = mock_intf.GetSessionAppId(session.handle)
+        assert app_id == expected_app_id
+
+        registry_intf.Register(expected_app_id, {})
+        session = self.create_dummy_session(dbus_con)
+        app_id = mock_intf.GetSessionAppId(session.handle)
+        assert app_id == expected_app_id
+
+    def test_conflicting_register(self, portals, dbus_con):
+        registry_intf = xdp.get_portal_iface(dbus_con, "Registry", domain="host")
+        mock_intf = xdp.get_mock_iface(dbus_con)
+
+        expected_app_id = "org.example.CorrectAppId"
+        unexpected_app_id = "org.example.WrongAppId"
+
+        registry_intf.Register(expected_app_id, {})
+        session = self.create_dummy_session(dbus_con)
+        app_id = mock_intf.GetSessionAppId(session.handle)
+        assert app_id == expected_app_id
+
+        with pytest.raises(dbus.exceptions.DBusException):
+            registry_intf.Register(unexpected_app_id, {})

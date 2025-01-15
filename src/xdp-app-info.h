@@ -34,6 +34,7 @@
 typedef enum _XdpAppInfoError
 {
   XDP_APP_INFO_ERROR_WRONG_APP_KIND,
+  XDP_APP_INFO_ERROR_REDUNDANT_REGISTRATION,
 } XdpAppInfoError;
 
 #define XDP_APP_INFO_ERROR (xdp_app_info_error_quark ())
@@ -85,7 +86,7 @@ XdpAppInfo * xdp_invocation_ensure_app_info_sync (GDBusMethodInvocation  *invoca
                                                   GCancellable           *cancellable,
                                                   GError                **error);
 
-XdpAppInfo * xdp_invocation_register_host_app_info_sync (GDBusMethodInvocation  *invocation,
-                                                         const char             *app_id,
-                                                         GCancellable           *cancellable,
-                                                         GError                **error);
+gboolean xdp_invocation_register_host_app_info_sync (GDBusMethodInvocation  *invocation,
+                                                     const char             *app_id,
+                                                     GCancellable           *cancellable,
+                                                     GError                **error);

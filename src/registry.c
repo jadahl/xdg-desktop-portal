@@ -60,28 +60,22 @@ handle_register (XdpDbusHostRegistry   *object,
                  const char            *arg_app_id,
                  GVariant              *arg_options)
 {
-  g_autoptr(XdpAppInfo) app_info = NULL;
   g_autoptr(GError) error = NULL;
 
-  app_info = xdp_invocation_register_host_app_info_sync (invocation, arg_app_id,
-                                                         NULL, &error);
-  if (!app_info)
+  if (!xdp_invocation_register_host_app_info_sync (invocation, arg_app_id,
+                                                   NULL, &error))
     {
-      g_dbus_method_invocation_return_error (invocation,
-                                             XDG_DESKTOP_PORTAL_ERROR,
-                                             XDG_DESKTOP_PORTAL_ERROR_FAILED,
-                                             "Could not register app ID: %s",
-                                             error->message);
-      return G_DBUS_METHOD_INVOCATION_HANDLED;
-    }
-
-  if (g_strcmp0 (xdp_app_info_get_id (app_info), arg_app_id) != 0)
-    {
-      g_dbus_method_invocation_return_error (invocation,
-                                             XDG_DESKTOP_PORTAL_ERROR,
-                                             XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
-                                             "Registered too late");
-      return G_DBUS_METHOD_INVOCATION_HANDLED;
+      if (!g_error_matches (error,
+                            XDP_APP_INFO_ERROR,
+                            XDP_APP_INFO_ERROR_REDUNDANT_REGISTRATION))
+        {
+          g_dbus_method_invocation_return_error (invocation,
+                                                 XDG_DESKTOP_PORTAL_ERROR,
+                                                 XDG_DESKTOP_PORTAL_ERROR_FAILED,
+                                                 "Could not register app ID: %s",
+                                                 error->message);
+          return G_DBUS_METHOD_INVOCATION_HANDLED;
+        }
     }
 
   xdp_dbus_host_registry_complete_register (object, invocation);
